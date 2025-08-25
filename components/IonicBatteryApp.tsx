@@ -45,7 +45,17 @@ const IonicBatteryApp = () => {
   // Check if Web Bluetooth is supported
   const checkBluetoothSupport = () => {
     if (!navigator.bluetooth) {
-      setError('Web Bluetooth is not supported in this browser. Try Chrome or Edge on Android, or Bluefy browser on iOS.');
+      // Detect browser type
+      const userAgent = navigator.userAgent.toLowerCase();
+      const isBluefy = userAgent.includes('bluefy');
+      
+      if (isBluefy) {
+        setError('Bluetooth API not accessible. Please ensure Bluefy has Bluetooth permissions in iOS Settings.');
+      } else if (/^((?!chrome|android).)*safari/i.test(navigator.userAgent)) {
+        setError('Safari doesn\'t support Web Bluetooth. Please use Bluefy Browser from the App Store.');
+      } else {
+        setError('Web Bluetooth is not supported in this browser. Try Chrome, Edge, or Bluefy.');
+      }
       return false;
     }
     return true;
@@ -83,11 +93,17 @@ const IonicBatteryApp = () => {
       await connectToDevice(device);
       
     } catch (err: any) {
-      addDebug(`Scan error: ${err.message}`);
+      console.error('Full error object:', err);
+      addDebug(`Scan error: ${err?.message || err?.name || JSON.stringify(err)}`);
+      
       if (err.name === 'NotFoundError') {
         setError('No Ionic battery found. Make sure your battery is powered on and within range.');
+      } else if (err.name === 'SecurityError') {
+        setError('Bluetooth permission denied. Please allow Bluetooth access and try again.');
+      } else if (err.name === 'NotAllowedError') {
+        setError('Bluetooth access not allowed. Make sure you granted permission to Bluefy.');
       } else {
-        setError(`Scanning failed: ${err.message}`);
+        setError(`Scanning failed: ${err?.message || err?.name || 'Unknown error'}`);
       }
     } finally {
       setIsScanning(false);
@@ -281,10 +297,28 @@ const IonicBatteryApp = () => {
               <p className="font-medium mb-1">Requirements:</p>
               <ul className="text-xs text-gray-300 list-disc list-inside">
                 <li>Use Chrome or Edge browser (not Safari)</li>
+                <li>On iPhone: Use Bluefy Browser from App Store</li>
                 <li>Enable Bluetooth on your device</li>
                 <li>Battery must be powered on</li>
-                <li>HTTPS connection required (✓ Vercel provides this)</li>
               </ul>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Safari Warning */}
+      {typeof navigator !== 'undefined' && !navigator.bluetooth && (
+        <div className="m-4 p-3 bg-yellow-900/50 border border-yellow-500 rounded-lg">
+          <div className="flex items-start space-x-2">
+            <AlertCircle className="w-5 h-5 text-yellow-400 flex-shrink-0 mt-0.5" />
+            <div className="text-sm">
+              <p className="font-medium text-yellow-400 mb-2">Browser Doesn't Support Bluetooth</p>
+              <p className="text-gray-300 mb-2">To connect to your battery:</p>
+              <ol className="text-xs text-gray-300 list-decimal list-inside space-y-1">
+                <li>On iPhone: Download "Bluefy - Web BLE Browser" from App Store</li>
+                <li>On Android: Use Chrome or Edge</li>
+                <li>Open this same URL in the supported browser</li>
+              </ol>
             </div>
           </div>
         </div>

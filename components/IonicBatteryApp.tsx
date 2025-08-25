@@ -9,7 +9,7 @@ const IonicBatteryApp = () => {
   const [batteryData, setBatteryData] = useState({
     voltage: 0,
     current: 0,
-    soc: 0, // State of Charge
+    soc: 0,
     temperature: 0,
     cycles: 0,
     power: 0,
@@ -17,48 +17,218 @@ const IonicBatteryApp = () => {
     timeToDischarge: '--:--',
     timeToCharge: '--:--'
   });
-  const [devices, setDevices] = useState<Array<{id: string, name: string, rssi: number, soc: number}>>([]);
-  const [selectedDevice, setSelectedDevice] = useState<any>(null);
+  const [device, setDevice] = useState<BluetoothDevice | null>(null);
+  const [server, setServer] = useState<BluetoothRemoteGATTServer | null>(null);
   const [error, setError] = useState('');
   const [activeTab, setActiveTab] = useState('basic');
   const [eventLog, setEventLog] = useState<Array<{time: string, message: string}>>([]);
   const [showPermissionNote, setShowPermissionNote] = useState(true);
+  const [debugInfo, setDebugInfo] = useState<string[]>([]);
 
-  // Simulate Bluetooth scanning
+  // Known UUIDs for battery services (standard and custom)
+  const BATTERY_SERVICE_UUID = 0x180F; // Standard Battery Service
+  const BATTERY_LEVEL_UUID = 0x2A19; // Standard Battery Level Characteristic
+  
+  // Possible custom UUIDs (these are guesses - you'll need to discover the real ones)
+  const POSSIBLE_SERVICE_UUIDS = [
+    '0000180f-0000-1000-8000-00805f9b34fb', // Standard Battery Service
+    '0000ff00-0000-1000-8000-00805f9b34fb', // Common custom service
+    '6e400001-b5a3-f393-e0a9-e50e24dcca9e', // Nordic UART Service (common for custom implementations)
+  ];
+
+  // Add debug logging
+  const addDebug = (message: string) => {
+    console.log(message);
+    setDebugInfo(prev => [...prev, `${new Date().toLocaleTimeString()}: ${message}`].slice(-10));
+  };
+
+  // Check if Web Bluetooth is supported
+  const checkBluetoothSupport = () => {
+    if (!navigator.bluetooth) {
+      setError('Web Bluetooth is not supported in this browser. Try Chrome or Edge on Android, or Bluefy browser on iOS.');
+      return false;
+    }
+    return true;
+  };
+
+  // Scan for Bluetooth devices
   const startScanning = async () => {
+    if (!checkBluetoothSupport()) return;
+
     setIsScanning(true);
     setError('');
     setShowPermissionNote(false);
+    setDebugInfo([]);
     
-    // Simulate finding devices - Note: real app shows all batteries in range
-    setTimeout(() => {
-      setDevices([
-        { id: '1', name: 'IC-24V50-EP', rssi: -45, soc: 75 },
-        { id: '2', name: 'IC-24V50-EP', rssi: -72, soc: 82 }
-      ]);
+    try {
+      addDebug('Starting Bluetooth scan...');
+      
+      // Request device with multiple filters
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [
+          { namePrefix: 'IC-' }, // Ionic batteries often start with IC-
+          { namePrefix: 'Ionic' },
+          { name: 'IC-24V50-EP' },
+        ],
+        optionalServices: [...POSSIBLE_SERVICE_UUIDS, BATTERY_SERVICE_UUID as any]
+      });
+      
+      addDebug(`Found device: ${device.name}`);
+      setDevice(device);
+      
+      // Set up disconnect listener
+      device.addEventListener('gattserverdisconnected', onDisconnected);
+      
+      // Auto-connect to the found device
+      await connectToDevice(device);
+      
+    } catch (err: any) {
+      addDebug(`Scan error: ${err.message}`);
+      if (err.name === 'NotFoundError') {
+        setError('No Ionic battery found. Make sure your battery is powered on and within range.');
+      } else {
+        setError(`Scanning failed: ${err.message}`);
+      }
+    } finally {
       setIsScanning(false);
-    }, 2000);
+    }
   };
 
-  // Connect to device
-  const connectToDevice = async (device: any) => {
-    setSelectedDevice(device);
-    setError('');
-    
-    // Simulate connection
-    setTimeout(() => {
+  // Connect to the device
+  const connectToDevice = async (device: BluetoothDevice) => {
+    try {
+      addDebug('Connecting to GATT server...');
+      const server = await device.gatt!.connect();
+      setServer(server);
+      addDebug('Connected to GATT server');
+      
+      // Discover services
+      addDebug('Discovering services...');
+      const services = await server.getPrimaryServices();
+      addDebug(`Found ${services.length} services`);
+      
+      // Log all services for debugging
+      for (const service of services) {
+        addDebug(`Service: ${service.uuid}`);
+        
+        try {
+          const characteristics = await service.getCharacteristics();
+          for (const char of characteristics) {
+            addDebug(`  - Characteristic: ${char.uuid}`);
+            
+            // Try to read the characteristic
+            if (char.properties.read) {
+              try {
+                const value = await char.readValue();
+                const data = new Uint8Array(value.buffer);
+                addDebug(`    Value: ${Array.from(data).join(', ')}`);
+                
+                // Try to parse battery data
+                await parseBatteryData(char, value);
+              } catch (e) {
+                addDebug(`    Could not read: ${e}`);
+              }
+            }
+            
+            // Set up notifications if available
+            if (char.properties.notify) {
+              try {
+                await char.startNotifications();
+                char.addEventListener('characteristicvaluechanged', handleCharacteristicChange);
+                addDebug(`    Notifications started`);
+              } catch (e) {
+                addDebug(`    Could not start notifications: ${e}`);
+              }
+            }
+          }
+        } catch (e) {
+          addDebug(`  Could not get characteristics: ${e}`);
+        }
+      }
+      
       setIsConnected(true);
-      // Start receiving battery data
-      startDataStream();
-      // Add connection event
       addEvent('Connected to battery');
-    }, 1000);
+      
+      // Try standard battery service
+      try {
+        const batteryService = await server.getPrimaryService(BATTERY_SERVICE_UUID as any);
+        const batteryLevel = await batteryService.getCharacteristic(BATTERY_LEVEL_UUID as any);
+        const value = await batteryLevel.readValue();
+        const level = value.getUint8(0);
+        setBatteryData(prev => ({ ...prev, soc: level }));
+        addDebug(`Battery level: ${level}%`);
+      } catch (e) {
+        addDebug('Standard battery service not found');
+      }
+      
+    } catch (err: any) {
+      addDebug(`Connection error: ${err.message}`);
+      setError(`Connection failed: ${err.message}`);
+      setIsConnected(false);
+    }
   };
 
-  // Disconnect
-  const disconnect = () => {
+  // Parse battery data from characteristic
+  const parseBatteryData = async (characteristic: BluetoothRemoteGATTCharacteristic, value: DataView) => {
+    const data = new Uint8Array(value.buffer);
+    
+    // Common parsing patterns for battery data
+    // This is where you'll need to figure out the actual data format
+    
+    // Example: If data length is 2, might be voltage (16-bit)
+    if (data.length === 2) {
+      const voltage = (data[0] << 8 | data[1]) / 100; // Often voltage is sent as voltage * 100
+      if (voltage > 20 && voltage < 30) { // Reasonable range for 24V battery
+        setBatteryData(prev => ({ ...prev, voltage }));
+        addDebug(`Possible voltage: ${voltage}V`);
+      }
+    }
+    
+    // Example: If data length is 4, might be voltage + current
+    if (data.length === 4) {
+      const voltage = (data[0] << 8 | data[1]) / 100;
+      const current = (data[2] << 8 | data[3]) / 100;
+      if (voltage > 20 && voltage < 30) {
+        setBatteryData(prev => ({ 
+          ...prev, 
+          voltage,
+          current: current - 128, // Often centered at 128 for +/- values
+          power: Math.abs(voltage * (current - 128))
+        }));
+        addDebug(`Possible V: ${voltage}V, I: ${current - 128}A`);
+      }
+    }
+    
+    // Example: Longer data might contain multiple values
+    if (data.length >= 8) {
+      // Try different parsing strategies
+      addDebug(`Long data (${data.length} bytes): ${Array.from(data).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+    }
+  };
+
+  // Handle characteristic value changes (notifications)
+  const handleCharacteristicChange = (event: Event) => {
+    const target = event.target as BluetoothRemoteGATTCharacteristic;
+    const value = target.value!;
+    parseBatteryData(target, value);
+  };
+
+  // Handle disconnection
+  const onDisconnected = () => {
+    addDebug('Device disconnected');
     setIsConnected(false);
-    setSelectedDevice(null);
+    setServer(null);
+    addEvent('Disconnected from battery');
+  };
+
+  // Disconnect manually
+  const disconnect = () => {
+    if (device && device.gatt?.connected) {
+      device.gatt.disconnect();
+    }
+    setIsConnected(false);
+    setDevice(null);
+    setServer(null);
     setBatteryData({
       voltage: 0,
       current: 0,
@@ -70,7 +240,6 @@ const IonicBatteryApp = () => {
       timeToDischarge: '--:--',
       timeToCharge: '--:--'
     });
-    addEvent('Disconnected from battery');
   };
 
   // Add event to log
@@ -78,44 +247,6 @@ const IonicBatteryApp = () => {
     const now = new Date();
     const timeStr = now.toLocaleTimeString();
     setEventLog(prev => [{time: timeStr, message}, ...prev].slice(0, 10));
-  };
-
-  // Simulate battery data updates
-  const startDataStream = () => {
-    const interval = setInterval(() => {
-      if (!isConnected) {
-        clearInterval(interval);
-        return;
-      }
-      
-      const voltage = 25.2 + (Math.random() * 1.2 - 0.6);
-      const current = Math.random() > 0.5 ? 
-        (5.2 + (Math.random() * 2 - 1)) : // Discharging
-        -(3.5 + (Math.random() * 1.5 - 0.75)); // Charging
-      
-      const power = Math.abs(voltage * current);
-      const soc = 75 + Math.floor(Math.random() * 10 - 5);
-      
-      // Calculate time estimates
-      const capacity = 50; // 50Ah battery
-      const remainingAh = capacity * (soc / 100);
-      const timeToDischarge = current > 0 ? (remainingAh / current) : 0;
-      const timeToCharge = current < 0 ? ((capacity - remainingAh) / Math.abs(current)) : 0;
-      
-      setBatteryData({
-        voltage: voltage,
-        current: current,
-        soc: soc,
-        temperature: 23 + (Math.random() * 4 - 2),
-        cycles: 127,
-        power: power,
-        status: current > 0 ? 'Discharging' : current < 0 ? 'Charging' : 'Standby',
-        timeToDischarge: timeToDischarge > 0 ? `${Math.floor(timeToDischarge)}h ${Math.floor((timeToDischarge % 1) * 60)}m` : '--:--',
-        timeToCharge: timeToCharge > 0 ? `${Math.floor(timeToCharge)}h ${Math.floor((timeToCharge % 1) * 60)}m` : '--:--'
-      });
-    }, 2000);
-    
-    return () => clearInterval(interval);
   };
 
   // Get battery status color
@@ -138,7 +269,7 @@ const IonicBatteryApp = () => {
     <div className="min-h-screen bg-gray-900 text-white max-w-md mx-auto">
       {/* Header */}
       <div className="bg-blue-600 p-4">
-        <h1 className="text-xl font-bold text-center">IonicBlueBatteries</h1>
+        <h1 className="text-xl font-bold text-center">Ionic Battery Monitor (Real BT)</h1>
       </div>
 
       {/* Permission Note */}
@@ -147,17 +278,13 @@ const IonicBatteryApp = () => {
           <div className="flex items-start space-x-2">
             <Info className="w-5 h-5 text-blue-400 flex-shrink-0 mt-0.5" />
             <div className="text-sm">
-              <p className="font-medium mb-1">Required Permissions:</p>
-              <div className="flex items-center space-x-4 text-xs text-gray-300">
-                <span className="flex items-center space-x-1">
-                  <Bluetooth className="w-4 h-4" />
-                  <span>Bluetooth</span>
-                </span>
-                <span className="flex items-center space-x-1">
-                  <MapPin className="w-4 h-4" />
-                  <span>Location (GPS)</span>
-                </span>
-              </div>
+              <p className="font-medium mb-1">Requirements:</p>
+              <ul className="text-xs text-gray-300 list-disc list-inside">
+                <li>Use Chrome or Edge browser (not Safari)</li>
+                <li>Enable Bluetooth on your device</li>
+                <li>Battery must be powered on</li>
+                <li>HTTPS connection required (✓ Vercel provides this)</li>
+              </ul>
             </div>
           </div>
         </div>
@@ -182,46 +309,25 @@ const IonicBatteryApp = () => {
             {isScanning ? (
               <>
                 <Loader2 className="w-5 h-5 animate-spin" />
-                <span>Searching for batteries...</span>
+                <span>Searching for Ionic battery...</span>
               </>
             ) : (
               <>
                 <Bluetooth className="w-5 h-5" />
-                <span>Link Device</span>
+                <span>Scan for Real Battery</span>
               </>
             )}
           </button>
 
-          {/* Device List */}
-          {devices.length > 0 && (
-            <div className="mt-4">
-              <h3 className="text-sm font-medium text-gray-400 mb-3">Available Batteries</h3>
-              <div className="space-y-2">
-                {devices.map((device) => (
-                  <button
-                    key={device.id}
-                    onClick={() => connectToDevice(device)}
-                    className="w-full p-4 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors"
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center space-x-3">
-                        <Battery className={`w-6 h-6 ${getBatteryColor(device.soc)}`} />
-                        <div className="text-left">
-                          <div className="font-medium">{device.name}</div>
-                          <div className="text-sm text-gray-400">SOC: {device.soc}%</div>
-                        </div>
-                      </div>
-                      <div className="flex items-center space-x-2">
-                        <Signal className="w-4 h-4 text-gray-400" />
-                        <span className="text-sm text-gray-400">{device.rssi} dBm</span>
-                      </div>
-                    </div>
-                  </button>
+          {/* Debug Info */}
+          {debugInfo.length > 0 && (
+            <div className="mt-4 p-3 bg-gray-800 rounded-lg">
+              <h3 className="text-sm font-medium mb-2">Debug Log:</h3>
+              <div className="text-xs font-mono space-y-1 max-h-40 overflow-y-auto">
+                {debugInfo.map((info, idx) => (
+                  <div key={idx} className="text-gray-400">{info}</div>
                 ))}
               </div>
-              <p className="text-xs text-gray-500 mt-3 text-center">
-                Note: Only one device can connect at a time
-              </p>
             </div>
           )}
         </div>
@@ -230,8 +336,18 @@ const IonicBatteryApp = () => {
       {/* Battery Dashboard - Only show when connected */}
       {isConnected && (
         <>
+          {/* Device Info */}
+          <div className="px-4 pt-4">
+            <div className="bg-gray-800 rounded-lg p-3">
+              <div className="text-sm">
+                <span className="text-gray-400">Connected to: </span>
+                <span className="font-medium">{device?.name || 'Unknown Device'}</span>
+              </div>
+            </div>
+          </div>
+
           {/* Tabs */}
-          <div className="flex bg-gray-800 border-b border-gray-700">
+          <div className="flex bg-gray-800 border-b border-gray-700 mt-4">
             <button
               onClick={() => setActiveTab('basic')}
               className={`flex-1 py-3 text-sm font-medium transition-colors ${
@@ -241,20 +357,12 @@ const IonicBatteryApp = () => {
               Basic Info
             </button>
             <button
-              onClick={() => setActiveTab('uitc')}
+              onClick={() => setActiveTab('debug')}
               className={`flex-1 py-3 text-sm font-medium transition-colors ${
-                activeTab === 'uitc' ? 'text-blue-500 border-b-2 border-blue-500' : 'text-gray-400'
+                activeTab === 'debug' ? 'text-blue-500 border-b-2 border-blue-500' : 'text-gray-400'
               }`}
             >
-              U.I.T.C
-            </button>
-            <button
-              onClick={() => setActiveTab('system')}
-              className={`flex-1 py-3 text-sm font-medium transition-colors ${
-                activeTab === 'system' ? 'text-blue-500 border-b-2 border-blue-500' : 'text-gray-400'
-              }`}
-            >
-              System Info
+              Debug
             </button>
           </div>
 
@@ -262,182 +370,44 @@ const IonicBatteryApp = () => {
             {/* Basic Info Tab */}
             {activeTab === 'basic' && (
               <div className="space-y-4">
-                {/* SOC Circle */}
-                <div className="bg-gray-800 rounded-xl p-6">
-                  <div className="relative w-48 h-48 mx-auto">
-                    <svg className="w-48 h-48 transform -rotate-90">
-                      <circle
-                        cx="96"
-                        cy="96"
-                        r="88"
-                        stroke="currentColor"
-                        strokeWidth="12"
-                        fill="none"
-                        className="text-gray-700"
-                      />
-                      <circle
-                        cx="96"
-                        cy="96"
-                        r="88"
-                        stroke="currentColor"
-                        strokeWidth="12"
-                        fill="none"
-                        strokeDasharray={`${2 * Math.PI * 88}`}
-                        strokeDashoffset={`${2 * Math.PI * 88 * (1 - batteryData.soc / 100)}`}
-                        className={getBatteryColor(batteryData.soc)}
-                        style={{ transition: 'stroke-dashoffset 0.5s ease' }}
-                      />
-                    </svg>
-                    <div className="absolute inset-0 flex flex-col items-center justify-center">
-                      <div className={`text-5xl font-bold ${getBatteryColor(batteryData.soc)}`}>
-                        {batteryData.soc}%
-                      </div>
-                      <div className="text-gray-400 text-sm">SOC</div>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Voltage and Capacity */}
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="bg-gray-800 rounded-lg p-4 text-center">
-                    <div className="text-2xl font-bold">{batteryData.voltage.toFixed(1)}V</div>
-                    <div className="text-sm text-gray-400">Voltage</div>
-                  </div>
-                  <div className="bg-gray-800 rounded-lg p-4 text-center">
-                    <div className="text-2xl font-bold">50Ah</div>
-                    <div className="text-sm text-gray-400">Capacity</div>
-                  </div>
-                </div>
-
-                {/* Status and Health */}
+                {/* Battery Data */}
                 <div className="bg-gray-800 rounded-lg p-4">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-gray-400">Status</span>
-                    <span className={`font-medium ${getStatusColor(batteryData.status)}`}>
-                      {batteryData.status}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Health</span>
-                    <span className="font-medium text-green-500">Good</span>
-                  </div>
-                </div>
-
-                {/* Time Estimates */}
-                {batteryData.status !== 'Standby' && (
-                  <div className="bg-gray-800 rounded-lg p-4">
-                    <div className="flex items-center justify-between">
-                      <span className="text-gray-400">
-                        {batteryData.status === 'Charging' ? 'Time to Full' : 'Time Remaining'}
-                      </span>
-                      <span className="font-medium">
-                        {batteryData.status === 'Charging' ? batteryData.timeToCharge : batteryData.timeToDischarge}
-                      </span>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* U.I.T.C Tab */}
-            {activeTab === 'uitc' && (
-              <div className="space-y-4">
-                {/* Voltage and Current Meters */}
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="bg-gray-800 rounded-lg p-4">
-                    <div className="text-center mb-2">
-                      <div className="text-3xl font-bold text-yellow-500">{batteryData.voltage.toFixed(1)}</div>
-                      <div className="text-sm text-gray-400">Voltage (V)</div>
-                    </div>
-                  </div>
-                  <div className="bg-gray-800 rounded-lg p-4">
-                    <div className="text-center mb-2">
-                      <div className={`text-3xl font-bold ${batteryData.current > 0 ? 'text-orange-500' : 'text-blue-500'}`}>
-                        {Math.abs(batteryData.current).toFixed(1)}
-                      </div>
-                      <div className="text-sm text-gray-400">
-                        Current (A) - {batteryData.current > 0 ? 'Discharge' : 'Charge'}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Temperature */}
-                <div className="bg-gray-800 rounded-lg p-4">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-gray-400">Temperature</span>
-                    <span className="text-sm text-gray-400">°C</span>
-                  </div>
-                  <div className="relative h-8 bg-gray-700 rounded-full overflow-hidden">
-                    <div 
-                      className="h-full bg-gradient-to-r from-blue-500 via-green-500 to-red-500 transition-all duration-500"
-                      style={{ width: `${(batteryData.temperature / 60) * 100}%` }}
-                    />
-                  </div>
-                  <div className="text-center mt-2 text-2xl font-bold">{batteryData.temperature.toFixed(1)}°C</div>
-                </div>
-
-                {/* Cycle Life */}
-                <div className="bg-gray-800 rounded-lg p-4">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-gray-400">Cycle Life</span>
-                    <span className="text-sm text-gray-400">/ 5000</span>
-                  </div>
-                  <div className="relative h-8 bg-gray-700 rounded-full overflow-hidden">
-                    <div 
-                      className="h-full bg-purple-500 transition-all duration-500"
-                      style={{ width: `${(batteryData.cycles / 5000) * 100}%` }}
-                    />
-                  </div>
-                  <div className="text-center mt-2 text-2xl font-bold">{batteryData.cycles} cycles</div>
-                </div>
-
-                {/* Power */}
-                <div className="bg-gray-800 rounded-lg p-4">
-                  <div className="text-center">
-                    <div className="text-3xl font-bold text-green-500">{batteryData.power.toFixed(1)}W</div>
-                    <div className="text-sm text-gray-400">Power Output</div>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* System Info Tab */}
-            {activeTab === 'system' && (
-              <div className="space-y-4">
-                <div className="bg-gray-800 rounded-lg p-4">
-                  <h3 className="font-medium mb-3">Event Log</h3>
-                  {eventLog.length > 0 ? (
-                    <div className="space-y-2 max-h-64 overflow-y-auto">
-                      {eventLog.map((event, index) => (
-                        <div key={index} className="text-sm border-b border-gray-700 pb-2">
-                          <div className="flex justify-between">
-                            <span className="text-gray-400">{event.time}</span>
-                            <span className="text-white">{event.message}</span>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-gray-400 text-center py-8">No events recorded</p>
-                  )}
-                </div>
-                
-                <div className="bg-gray-800 rounded-lg p-4">
-                  <h3 className="font-medium mb-3">Battery Information</h3>
+                  <h3 className="font-medium mb-3">Battery Data</h3>
                   <div className="space-y-2 text-sm">
                     <div className="flex justify-between">
-                      <span className="text-gray-400">Model</span>
-                      <span>IC-24V50-EP</span>
+                      <span className="text-gray-400">State of Charge</span>
+                      <span>{batteryData.soc}%</span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-gray-400">Firmware</span>
-                      <span>v2.1.3</span>
+                      <span className="text-gray-400">Voltage</span>
+                      <span>{batteryData.voltage.toFixed(2)}V</span>
                     </div>
                     <div className="flex justify-between">
-                      <span className="text-gray-400">BMS Version</span>
-                      <span>1.0.5</span>
+                      <span className="text-gray-400">Current</span>
+                      <span>{batteryData.current.toFixed(2)}A</span>
                     </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-400">Power</span>
+                      <span>{batteryData.power.toFixed(2)}W</span>
+                    </div>
+                  </div>
+                </div>
+
+                <p className="text-xs text-gray-500 text-center">
+                  Note: Data parsing is experimental. Values may not be accurate until proper protocol is implemented.
+                </p>
+              </div>
+            )}
+
+            {/* Debug Tab */}
+            {activeTab === 'debug' && (
+              <div className="space-y-4">
+                <div className="bg-gray-800 rounded-lg p-4">
+                  <h3 className="font-medium mb-3">Bluetooth Debug Log</h3>
+                  <div className="text-xs font-mono space-y-1 max-h-64 overflow-y-auto">
+                    {debugInfo.map((info, idx) => (
+                      <div key={idx} className="text-gray-400">{info}</div>
+                    ))}
                   </div>
                 </div>
               </div>
@@ -454,12 +424,17 @@ const IonicBatteryApp = () => {
         </>
       )}
 
-      {/* Bottom Info */}
-      {!isConnected && (
-        <div className="p-4 mt-auto">
-          <div className="text-center text-xs text-gray-500">
-            <p>Bluetooth range: ~10 feet (3 meters)</p>
-            <p className="mt-1">Default rename password: 0000</p>
+      {/* Instructions */}
+      {!isConnected && !isScanning && (
+        <div className="p-4 mt-4">
+          <div className="bg-yellow-900/30 border border-yellow-600 rounded-lg p-4">
+            <h3 className="font-medium text-yellow-400 mb-2">⚠️ Experimental Feature</h3>
+            <p className="text-sm text-gray-300 mb-3">
+              This attempts to connect to your real Ionic battery via Web Bluetooth. However, the data protocol is not publicly documented.
+            </p>
+            <p className="text-sm text-gray-300">
+              The app will try to discover services and characteristics, but proper data parsing requires reverse-engineering the Ionic protocol.
+            </p>
           </div>
         </div>
       )}
